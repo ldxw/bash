@@ -1,0 +1,19 @@
+version: "3"
+services:
+  php-nginx:
+    restart: always
+    image: nginx
+    container_name: php-nginx
+    volumes:
+      - ./nginx/www:/usr/share/nginx/html
+      - ./nginx/conf:/etc/nginx/conf.d
+    ports:
+    - 8012:80
+  myphp7:
+    restart: always
+    image: php:7.1.30-fpm
+    container_name: myphp7
+    privileged: true
+    volumes:
+      - ./nginx/www:/www
+
