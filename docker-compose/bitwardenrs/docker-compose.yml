@@ -8,7 +8,7 @@ services:
     network_mode: bitwardenrs
     environment:
       - WEBSOCKET_ENABLED=true  # Enable WebSocket notifications.
-      - ADMIN_TOKEN=√‹‘ø
+      - ADMIN_TOKEN=ÂØÜÁ†Å
       - SIGNUPS_ALLOWED=false
       - SMTP_EXPLICIT_TLS=true
     volumes:
@@ -33,6 +33,6 @@ services:
       - ./caddy-data:/data
       
     environment:
-      - DOMAIN=”Ú√˚  # Your domain.
-      - EMAIL=” œ‰      # The email address to use for ACME registration.
+      - DOMAIN=ÂüüÂêç  # Your domain.
+      - EMAIL=ÈÇÆÁÆ±      # The email address to use for ACME registration.
       - LOG_FILE=/data/access.log
