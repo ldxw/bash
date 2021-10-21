@@ -1,0 +1,38 @@
+version: '3'
+
+services:
+  bitwarden:
+    image: vaultwarden/server:latest
+    container_name: bitwardenrs
+    restart: always
+    network_mode: bitwardenrs
+    environment:
+      - WEBSOCKET_ENABLED=true  # Enable WebSocket notifications.
+      - ADMIN_TOKEN=√‹‘ø
+      - SIGNUPS_ALLOWED=false
+      - SMTP_EXPLICIT_TLS=true
+    volumes:
+      #- /media/160G/docker/bitwardenrs/data:/data
+       - ./bw-data:/data
+      #- /media/160G/docker/bitwardenrs/token:/etc/bitwarden_rs/token
+       - ./token:/etc/bitwarden_rs/token
+       - /etc/localtime:/etc/localtime:ro
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy2
+    restart: always
+    network_mode: bitwardenrs
+    ports:
+      - 88:80  # Needed for the ACME HTTP-01 challenge.
+      - 8443:443
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-config:/config
+      - /media/160G/docker/acme.sh/out/ssl/bitwardenrs:/config/ssl
+      - ./caddy-data:/data
+      
+    environment:
+      - DOMAIN=”Ú√˚  # Your domain.
+      - EMAIL=” œ‰      # The email address to use for ACME registration.
+      - LOG_FILE=/data/access.log
