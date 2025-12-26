@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =========================================================
-# 变动触发全量压缩备份（最终最终版：无 at 依赖）
+# 变动触发全量压缩备份（最终版：无 at 依赖 + 每目录保留最近 N 份）
 #
 # 特性：
 # 1) 检测目录内“文件变化”（只看文件：相对路径 + size + mtime）
@@ -11,7 +11,8 @@ set -euo pipefail
 # 2) 文件未变化补传时：优先复用上次生成的 zip（不重打包）
 # 3) 每个目录独立 state：DEST_DIR/<DIR_KEY>/.state/
 # 4) 清理：本地 + 七牛 + WebDAV（按 RETENTION_HOURS）
-#    - 七牛/WebDAV 清理都跳过本次刚上传的文件（O(1)）
+#    - 新增：每个 DIR_KEY 永远至少保留最近 KEEP_LAST_N 份（防止“无变化 -> 备份被删光”）
+#    - 七牛/WebDAV 清理跳过本次刚上传的文件（O(1)）
 #
 # 配置文件：
 # - 默认：脚本同目录 backup.conf
@@ -21,6 +22,9 @@ set -euo pipefail
 #   DEST_DIR="./backup_out"
 #   PASSWORD_FILE="./password"
 #   WEBDAV_PASS_FILE="./webdav_pass"
+#
+# 新增配置：
+#   KEEP_LAST_N=3   # 每个目录至少保留最近 3 份备份
 # =========================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -49,6 +53,7 @@ source "$CONFIG_FILE"
 : "${UPLOAD_MISSING_BACKENDS_WHEN_UNCHANGED:=1}"
 
 : "${RETENTION_HOURS:=24}"
+: "${KEEP_LAST_N:=1}"
 : "${TIMEZONE:=Asia/Shanghai}"
 
 : "${QINIU_BUCKET:=}"
@@ -220,13 +225,18 @@ if [ "${#SOURCE_DIRS[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# KEEP_LAST_N 最小为 1
+if [ "${KEEP_LAST_N:-1}" -lt 1 ]; then
+  KEEP_LAST_N=1
+fi
+
 PASSWORD="$(read_file_or_die "$PASSWORD_FILE" "zip 密码文件为空：$PASSWORD_FILE")"
 
 WEBDAV_PASS=""
 if [ "$ENABLE_WEBDAV" -eq 1 ]; then
   [ -n "${WEBDAV_BASE_URL:-}" ] || { echo "WEBDAV_BASE_URL 为空"; exit 1; }
   [ -n "${WEBDAV_USER:-}" ] || { echo "WEBDAV_USER 为空"; exit 1; }
-  WEBDAV_BASE_URL="${WEBDAV_BASE_URL%/}" # 防止出现双斜杠
+  WEBDAV_BASE_URL="${WEBDAV_BASE_URL%/}"
   WEBDAV_PASS="$(read_file_or_die "$WEBDAV_PASS_FILE" "WebDAV 密码文件为空：$WEBDAV_PASS_FILE")"
 fi
 
@@ -410,31 +420,67 @@ for SOURCE_DIR in "${SOURCE_DIRS[@]}"; do
 done
 
 # =========================================================
-# 远端清理：七牛
+# 远端清理：七牛（按 RETENTION_HOURS + 每个 DIR_KEY 保留最近 KEEP_LAST_N 份）
 # =========================================================
 if [ "$ENABLE_QINIU" -eq 1 ]; then
   now_ts="$(date +%s)"
   cutoff_ts=$(( now_ts - RETENTION_HOURS*3600 ))
+  tmp_qiniu="$(mktemp)"
+
+  mapfile -t UNIQUE_DIR_KEYS < <(
+    for SOURCE_DIR in "${SOURCE_DIRS[@]}"; do
+      SOURCE_DIR="${SOURCE_DIR%/}"
+      [ -d "$SOURCE_DIR" ] || continue
+      DIR_NAME="$(basename "$SOURCE_DIR")"
+      DIR_HASH="$(printf "%s" "$SOURCE_DIR" | sha1sum | awk '{print $1}' | cut -c1-8)"
+      echo "${DIR_NAME}-${DIR_HASH}"
+    done | awk '!seen[$0]++'
+  )
 
   qshell listbucket "$QINIU_BUCKET" | sed '1,3d' | while IFS=$'\t' read -r key type mime_size put_time; do
     [[ $key != "${QINIU_DIR}/${HOSTNAME_TAG}/"*"/"*.zip ]] && continue
     [[ -n "${QINIU_UPLOADED_SET[$key]+x}" ]] && continue
 
+    dirkey="$(echo "$key" | awk -F'/' -v q="$QINIU_DIR" -v h="$HOSTNAME_TAG" '
+      $1==q && $2==h {print $3}
+    ')"
+    [ -n "$dirkey" ] || continue
+
     file_local_time="$(qiniu_time_to_local "$put_time")"
     file_ts="$(date -d "$file_local_time" +%s 2>/dev/null || true)"
     [ -n "${file_ts:-}" ] || continue
 
-    if [ "$file_ts" -lt "$cutoff_ts" ]; then
-      if qshell delete "$QINIU_BUCKET" "$key" >/dev/null; then
-        age_h=$(( (now_ts - file_ts) / 3600 ))
-        log "已删除七牛过期文件：$key（${age_h}h）"
-      fi
-    fi
+    printf "%s\t%s\t%s\n" "$dirkey" "$key" "$file_ts" >> "$tmp_qiniu"
   done
+
+  for dirkey in "${UNIQUE_DIR_KEYS[@]}"; do
+    mapfile -t lines < <(awk -v d="$dirkey" -F'\t' '$1==d {print $0}' "$tmp_qiniu" | sort -t$'\t' -k3,3nr)
+    [ "${#lines[@]}" -eq 0 ] && continue
+
+    idx=0
+    for line in "${lines[@]}"; do
+      idx=$((idx+1))
+      key="$(echo "$line" | awk -F'\t' '{print $2}')"
+      file_ts="$(echo "$line" | awk -F'\t' '{print $3}')"
+
+      if [ "$idx" -le "$KEEP_LAST_N" ]; then
+        continue
+      fi
+
+      if [ "$file_ts" -lt "$cutoff_ts" ]; then
+        if qshell delete "$QINIU_BUCKET" "$key" >/dev/null; then
+          age_h=$(( (now_ts - file_ts) / 3600 ))
+          log "已删除七牛过期文件：$key（${age_h}h）"
+        fi
+      fi
+    done
+  done
+
+  rm -f "$tmp_qiniu"
 fi
 
 # =========================================================
-# 远端清理：WebDAV
+# 远端清理：WebDAV（按 RETENTION_HOURS + 每个 DIR_KEY 保留最近 KEEP_LAST_N 份）
 # =========================================================
 if [ "$ENABLE_WEBDAV" -eq 1 ]; then
   now_ts="$(date +%s)"
@@ -453,32 +499,69 @@ if [ "$ENABLE_WEBDAV" -eq 1 ]; then
   for DIR_KEY in "${UNIQUE_DIR_KEYS[@]}"; do
     remote_dir_rel="${WEBDAV_DIR}/${HOSTNAME_TAG}/${DIR_KEY}/"
 
-    while IFS=$'\t' read -r name lastmod; do
-      [ -z "${name:-}" ] && continue
-      [ -z "${lastmod:-}" ] && continue
-      [[ "$name" != *.zip ]] && continue
+    mapfile -t files < <(
+      webdav_list_zip_with_lastmod "$remote_dir_rel" | while IFS=$'\t' read -r name lastmod; do
+        [ -z "${name:-}" ] && continue
+        [ -z "${lastmod:-}" ] && continue
+        [[ "$name" != *.zip ]] && continue
+        ts="$(TZ=$TIMEZONE date -d "$lastmod" +%s 2>/dev/null || true)"
+        [ -n "${ts:-}" ] || continue
+        printf "%s\t%s\n" "$ts" "$name"
+      done | sort -t$'\t' -k1,1nr
+    )
+
+    idx=0
+    for item in "${files[@]}"; do
+      idx=$((idx+1))
+      file_ts="$(echo "$item" | awk -F'\t' '{print $1}')"
+      name="$(echo "$item" | awk -F'\t' '{print $2}')"
 
       remote_rel="${WEBDAV_DIR}/${HOSTNAME_TAG}/${DIR_KEY}/${name}"
       [[ -n "${WEBDAV_UPLOADED_SET[$remote_rel]+x}" ]] && continue
 
-      file_ts="$(TZ=$TIMEZONE date -d "$lastmod" +%s 2>/dev/null || true)"
-      [ -n "${file_ts:-}" ] || continue
+      if [ "$idx" -le "$KEEP_LAST_N" ]; then
+        continue
+      fi
 
       if [ "$file_ts" -lt "$cutoff_ts" ]; then
         webdav_delete "$remote_rel"
         age_h=$(( (now_ts - file_ts) / 3600 ))
         log "已删除 WebDAV 过期文件：$remote_rel（${age_h}h）"
       fi
-    done < <(webdav_list_zip_with_lastmod "$remote_dir_rel" || true)
+    done
   done
 fi
 
 # =========================================================
-# 本地清理（按 RETENTION_HOURS）
+# 本地清理（按 RETENTION_HOURS + 每个 DIR_KEY 保留最近 KEEP_LAST_N 份）
 # =========================================================
-find "$DEST_DIR" -type f -name "*.zip" -mmin +$((RETENTION_HOURS*60)) -delete && \
-  log "本地过期文件清理完成"
+now_ts="$(date +%s)"
+cutoff_ts=$(( now_ts - RETENTION_HOURS*3600 ))
+
+shopt -s nullglob
+for dir in "$DEST_DIR"/*/; do
+  [ -d "$dir" ] || continue
+
+  mapfile -t zips < <(ls -1t "${dir}"/*.zip 2>/dev/null || true)
+  [ "${#zips[@]}" -eq 0 ] && continue
+
+  idx=0
+  for z in "${zips[@]}"; do
+    idx=$((idx+1))
+
+    if [ "$idx" -le "$KEEP_LAST_N" ]; then
+      continue
+    fi
+
+    file_ts="$(stat -c %Y "$z" 2>/dev/null || echo 0)"
+    if [ "$file_ts" -lt "$cutoff_ts" ]; then
+      rm -f "$z" && log "本地已删除过期文件：$z"
+    fi
+  done
+done
+shopt -u nullglob
+log "本地过期文件清理完成（保留每目录最近 ${KEEP_LAST_N} 份 + ${RETENTION_HOURS} 小时）"
 
 unset PASSWORD
 unset WEBDAV_PASS
-echo -e "\n[$(date)] \e[32m所有操作完成，保留时长：${RETENTION_HOURS}小时\e[0m"
+echo -e "\n[$(date)] \e[32m所有操作完成，保留时长：${RETENTION_HOURS}小时；每目录至少保留最近 ${KEEP_LAST_N} 份\e[0m"
