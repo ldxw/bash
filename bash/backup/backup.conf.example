@@ -78,6 +78,9 @@ UPLOAD_MISSING_BACKENDS_WHEN_UNCHANGED=1
 #
 RETENTION_HOURS=24
 
+# 每个目录（DIR_KEY）至少保留最近 N 份备份（即使超过 RETENTION_HOURS 也不删）
+KEEP_LAST_N=3
+
 # 时区设置（用于时间计算）
 #
 TIMEZONE=Asia/Shanghai
